@@ -4,7 +4,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import * as mpv from './mpv.js';
 import { fetchFeed, fetchVideoInfo, pickVideoFields } from './ytdlp.js';
-import { validateYouTubeUrl, validateVideoUrl, validateTikTokUrl, checkDeps, errorResult, textResult, stripChannelSuffix, FEED_URLS } from './validate.js';
+import { validateYouTubeUrl, validateVideoUrl, validateTikTokUrl, checkDeps, errorResult, textResult, stripChannelSuffix, FEED_URLS, getBrowser, setBrowser, SUPPORTED_BROWSERS } from './validate.js';
 
 const server = new McpServer({ name: 'social-video-mcp', version: '2.0.0' });
 
@@ -12,19 +12,20 @@ const server = new McpServer({ name: 'social-video-mcp', version: '2.0.0' });
 
 server.tool(
   'play_video',
-  'Play a video from YouTube or TikTok in a lightweight mpv player window. Optionally start at a specific timestamp.',
+  'Play a video from YouTube or TikTok in a lightweight mpv player window. Optionally start at a specific timestamp. Set audio_only to true for audio-only playback (great for podcasts/music while coding).',
   {
     url: z.string().url().describe('YouTube or TikTok video URL'),
     timestamp: z.number().min(0).optional().describe('Start position in seconds'),
+    audio_only: z.boolean().default(false).describe('Audio-only mode — no video window, just audio'),
   },
-  async ({ url, timestamp }) => {
+  async ({ url, timestamp, audio_only }) => {
     const urlErr = validateVideoUrl(url);
     if (urlErr) return errorResult(urlErr);
     const depErr = checkDeps();
     if (depErr) return errorResult(depErr);
 
     try {
-      await mpv.launch({ url, timestamp });
+      await mpv.launch({ url, timestamp, audioOnly: audio_only });
     } catch {
       return errorResult('mpv failed to start. Run `mpv <url>` manually to see the error.');
     }
@@ -32,7 +33,7 @@ server.tool(
     let title = url;
     try { title = (await mpv.getProperty('media-title')) as string || url; } catch { /* loading */ }
 
-    return textResult({ status: 'playing', title, url, ...(timestamp ? { startedAt: `${timestamp}s` } : {}) });
+    return textResult({ status: 'playing', title, url, audioOnly: audio_only, ...(timestamp ? { startedAt: `${timestamp}s` } : {}) });
   }
 );
 
@@ -509,6 +510,150 @@ server.tool(
     } catch (err) {
       return errorResult(`Error: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+);
+
+// --- Queue management ---
+
+server.tool(
+  'queue_video',
+  'Add a video to the end of the current playback queue without interrupting what is playing. If nothing is playing, starts playback.',
+  {
+    url: z.string().url().describe('YouTube or TikTok video URL to add to queue'),
+  },
+  async ({ url }) => {
+    const urlErr = validateVideoUrl(url);
+    if (urlErr) return errorResult(urlErr);
+    const depErr = checkDeps();
+    if (depErr) return errorResult(depErr);
+
+    if (!mpv.isPlaying()) {
+      try {
+        await mpv.launch({ url });
+      } catch {
+        return errorResult('mpv failed to start.');
+      }
+      let title = url;
+      try { title = (await mpv.getProperty('media-title')) as string || url; } catch { /* loading */ }
+      return textResult({ status: 'playing', title, url });
+    }
+
+    try {
+      await mpv.appendUrl(url);
+      const count = await mpv.getProperty('playlist-count');
+      return textResult({ status: 'queued', url, queuePosition: count });
+    } catch (err) {
+      return errorResult(`Error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+);
+
+// --- Audio-only playback ---
+
+server.tool(
+  'play_audio',
+  'Play audio only from a YouTube or TikTok video — no video window. Perfect for podcasts, music, and long-form content while you code.',
+  {
+    url: z.string().url().describe('YouTube or TikTok video URL'),
+    timestamp: z.number().min(0).optional().describe('Start position in seconds'),
+  },
+  async ({ url, timestamp }) => {
+    const urlErr = validateVideoUrl(url);
+    if (urlErr) return errorResult(urlErr);
+    const depErr = checkDeps();
+    if (depErr) return errorResult(depErr);
+
+    try {
+      await mpv.launch({ url, timestamp, audioOnly: true });
+    } catch {
+      return errorResult('mpv failed to start.');
+    }
+
+    let title = url;
+    try { title = (await mpv.getProperty('media-title')) as string || url; } catch { /* loading */ }
+
+    return textResult({ status: 'playing_audio', title, url, ...(timestamp ? { startedAt: `${timestamp}s` } : {}) });
+  }
+);
+
+// --- Smart recommendations ---
+
+server.tool(
+  'play_similar',
+  'Play videos similar to what is currently playing. Fetches the current video\'s channel and searches for related content, then queues or plays the results.',
+  {
+    limit: z.number().min(1).max(20).default(10).describe('Number of similar videos to find (default 10)'),
+    play_now: z.boolean().default(false).describe('Replace current playback (true) or add to queue (false)'),
+  },
+  async ({ limit, play_now }) => {
+    const depErr = checkDeps();
+    if (depErr) return errorResult(depErr);
+
+    if (!mpv.isPlaying()) return errorResult('No video is currently playing.');
+
+    let currentTitle: string;
+    try {
+      currentTitle = (await mpv.getProperty('media-title')) as string;
+      if (!currentTitle) return errorResult('Cannot determine current video title.');
+    } catch {
+      return errorResult('Cannot get current video info. Is a video playing?');
+    }
+
+    try {
+      const result = await fetchFeed(
+        `https://www.youtube.com/results?search_query=${encodeURIComponent(currentTitle)}`,
+        limit + 5 // fetch extra to filter out the current video
+      );
+      const videos = (result.entries || [])
+        .filter((e) => e.title !== currentTitle)
+        .slice(0, limit);
+
+      if (videos.length === 0) return textResult('No similar videos found.');
+
+      if (play_now) {
+        const urls = videos.map((e) => e.url as string).filter(Boolean);
+        const playlistFile = mpv.writeTempPlaylist(urls);
+        await mpv.launch({ playlistFile, socketTimeoutMs: 15_000 });
+
+        let title = 'Similar videos';
+        try { title = (await mpv.getProperty('media-title')) as string || title; } catch { /* loading */ }
+
+        return textResult({ status: 'playing_similar', basedOn: currentTitle, title, total: urls.length });
+      } else {
+        let queued = 0;
+        for (const e of videos) {
+          const vUrl = e.url as string;
+          if (vUrl) { await mpv.appendUrl(vUrl); queued++; }
+        }
+        return textResult({ status: 'queued_similar', basedOn: currentTitle, queued });
+      }
+    } catch (err) {
+      return errorResult(`Error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+);
+
+// --- Browser configuration ---
+
+server.tool(
+  'set_browser',
+  `Switch which browser's cookies are used for authenticated requests. Supports: ${[...SUPPORTED_BROWSERS].join(', ')}. Default is chrome.`,
+  {
+    browser: z.string().describe(`Browser name: ${[...SUPPORTED_BROWSERS].join(', ')}`),
+  },
+  async ({ browser }) => {
+    const err = setBrowser(browser);
+    if (err) return errorResult(err);
+    return textResult({ status: 'browser_updated', browser: getBrowser() });
+  }
+);
+
+server.tool(
+  'get_browser',
+  'Check which browser is currently being used for cookie-based authentication.',
+  {},
+  async () => {
+    return textResult({ browser: getBrowser(), supported: [...SUPPORTED_BROWSERS] });
   }
 );
 

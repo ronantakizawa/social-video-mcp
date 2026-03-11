@@ -1,5 +1,5 @@
 import { spawn } from 'child_process';
-import { BROWSER } from './validate.js';
+import { getBrowser } from './validate.js';
 
 const TIMEOUT_MS = 60_000;
 
@@ -41,7 +41,7 @@ export function fetchFeed(url: string, limit: number, start = 1): Promise<YtFeed
     url, '-J', '--flat-playlist',
     '--playlist-start', String(start),
     '--playlist-end', String(start + limit - 1),
-    '--cookies-from-browser', BROWSER,
+    '--cookies-from-browser', getBrowser(),
   ];
 
   // YouTube-specific extractor arg
@@ -55,7 +55,7 @@ export function fetchFeed(url: string, limit: number, start = 1): Promise<YtFeed
 export function fetchVideoInfo(url: string): Promise<YtEntry> {
   return spawnYtDlp([
     url, '-J', '--no-playlist',
-    '--cookies-from-browser', BROWSER,
+    '--cookies-from-browser', getBrowser(),
   ]).then((out) => JSON.parse(out));
 }
 

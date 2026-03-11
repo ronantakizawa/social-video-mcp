@@ -4,7 +4,7 @@ import { unlinkSync, existsSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { randomBytes } from 'crypto';
-import { BROWSER } from './validate.js';
+import { getBrowser } from './validate.js';
 
 const SOCKET_PATH = join(tmpdir(), `mpv-mcp-${process.getuid?.() ?? process.pid}-${randomBytes(4).toString('hex')}.sock`);
 
@@ -96,6 +96,7 @@ interface LaunchOptions {
   shuffle?: boolean;
   timestamp?: number;
   socketTimeoutMs?: number;
+  audioOnly?: boolean;
 }
 
 export async function launch(opts: LaunchOptions): Promise<void> {
@@ -103,12 +104,17 @@ export async function launch(opts: LaunchOptions): Promise<void> {
 
   const args = [
     `--input-ipc-server=${SOCKET_PATH}`,
-    '--force-window',
     '--no-terminal',
     '--ytdl',
-    `--ytdl-raw-options=cookies-from-browser=${BROWSER}`,
+    `--ytdl-raw-options=cookies-from-browser=${getBrowser()}`,
     '--prefetch-playlist',
   ];
+
+  if (opts.audioOnly) {
+    args.push('--no-video');
+  } else {
+    args.push('--force-window');
+  }
 
   if (opts.shuffle) args.push('--shuffle');
   if (opts.timestamp && opts.timestamp > 0) args.push(`--start=${opts.timestamp}`);

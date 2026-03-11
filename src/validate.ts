@@ -78,7 +78,23 @@ export function stripChannelSuffix(url: string): string {
   return url.replace(/\/(shorts|videos)?\/?$/, '');
 }
 
-export const BROWSER = 'chrome';
+const SUPPORTED_BROWSERS = ['chrome', 'firefox', 'brave', 'edge', 'safari', 'opera', 'chromium', 'vivaldi'] as const;
+export type BrowserName = typeof SUPPORTED_BROWSERS[number];
+
+let currentBrowser: BrowserName = 'chrome';
+
+export function getBrowser(): BrowserName { return currentBrowser; }
+
+export function setBrowser(name: string): string | null {
+  const lower = name.toLowerCase() as BrowserName;
+  if (!SUPPORTED_BROWSERS.includes(lower)) {
+    return `Unsupported browser: ${name}. Supported: ${SUPPORTED_BROWSERS.join(', ')}`;
+  }
+  currentBrowser = lower;
+  return null;
+}
+
+export { SUPPORTED_BROWSERS };
 
 export const FEED_URLS: Record<string, string> = {
   subscriptions: 'https://www.youtube.com/feed/subscriptions',

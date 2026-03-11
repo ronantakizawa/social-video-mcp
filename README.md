@@ -13,7 +13,13 @@ https://github.com/user-attachments/assets/08ddb1b3-ed0f-4de3-b465-c0b58ebfa894
 **Playback** — Play videos from YouTube or TikTok in a native mpv window with full remote control:
 - Play, pause, stop, seek
 - Playlist playback with next/prev navigation and shuffle
-- Authenticated playback via Chrome cookies (age-restricted, private videos)
+- Queue videos without interrupting current playback
+- Audio-only mode for podcasts and music while you code
+- Authenticated playback via browser cookies (age-restricted, private videos)
+
+**Smart Recommendations** — Ask for similar content based on what's currently playing. Finds related videos and queues them automatically.
+
+**Infinite Playlists** — TikTok and YouTube Shorts playlists auto-refill as you watch. Never runs out.
 
 **YouTube Account** — Browse your YouTube account directly from your AI agent:
 - Subscription feed, liked videos, watch later, history
@@ -25,6 +31,8 @@ https://github.com/user-attachments/assets/08ddb1b3-ed0f-4de3-b465-c0b58ebfa894
 - Fetch videos from any TikTok user profile
 - Play a user's videos as a continuous playlist
 
+**Multi-Browser Support** — Switch between Chrome, Firefox, Brave, Edge, Safari, Opera, Chromium, or Vivaldi for cookie-based authentication.
+
 **Video Info** — Fetch metadata without playing: title, description, chapters, duration, tags, view/like counts.
 
 ## Prerequisites
@@ -35,7 +43,7 @@ brew install mpv yt-dlp
 
 - **mpv** — Lightweight video player
 - **yt-dlp** — Video stream resolver and cookie extractor
-- **Google Chrome** — Logged into YouTube/TikTok (for authenticated features)
+- **A supported browser** — Logged into YouTube/TikTok (Chrome, Firefox, Brave, Edge, Safari, Opera, Chromium, Vivaldi)
 - **Node.js** >= 18
 
 ## Installation
@@ -71,14 +79,22 @@ Then restart Claude Code.
 
 | Tool | Description |
 |------|-------------|
-| `play_video` | Play a YouTube or TikTok video. Optional `timestamp`. |
+| `play_video` | Play a YouTube or TikTok video. Optional `timestamp` and `audio_only` mode. |
+| `play_audio` | Play audio only — no video window. Great for podcasts and music. |
 | `play_playlist` | Play an entire YouTube playlist. Optional `shuffle`. |
+| `queue_video` | Add a video to the queue without interrupting current playback. |
 | `pause_video` | Toggle pause/resume. |
 | `stop_video` | Stop playback and close the player window. |
 | `seek_video` | Seek to an absolute position in seconds. |
 | `next_video` | Skip to the next video in a playlist. |
 | `prev_video` | Go back to the previous video in a playlist. |
 | `get_status` | Get current playback state: title, position, duration, paused. |
+
+### Smart Features
+
+| Tool | Description |
+|------|-------------|
+| `play_similar` | Find and play/queue videos similar to what's currently playing. |
 
 ### YouTube Account
 
@@ -97,19 +113,22 @@ Then restart Claude Code.
 | Tool | Description |
 |------|-------------|
 | `get_tiktok_user_videos` | Fetch recent videos from a TikTok user profile. |
-| `play_tiktok_user` | Play a TikTok user's videos as a continuous playlist. |
+| `play_tiktok_user` | Play a TikTok user's videos as an infinite continuous playlist. |
 
-### Metadata
+### Settings
 
 | Tool | Description |
 |------|-------------|
+| `set_browser` | Switch browser for cookie auth (chrome, firefox, brave, edge, safari, opera, chromium, vivaldi). |
+| `get_browser` | Check which browser is currently active. |
 | `get_video_info` | Fetch full video metadata from YouTube or TikTok. |
 
 ## How It Works
 
 - **Playback**: Spawns `mpv` with `--input-ipc-server` for JSON IPC control over a Unix socket. All playback commands (pause, seek, next/prev) are sent through this socket.
-- **Data Fetching**: Calls `yt-dlp` directly with `-J --flat-playlist --cookies-from-browser chrome` to fetch structured JSON from video platforms.
-- **Authentication**: Reads cookies from Chrome's local storage via yt-dlp's `--cookies-from-browser` flag. No OAuth setup required — if you're logged into a platform in Chrome, it just works.
+- **Data Fetching**: Calls `yt-dlp` directly with `-J --flat-playlist --cookies-from-browser <browser>` to fetch structured JSON from video platforms.
+- **Authentication**: Reads cookies from your browser's local storage via yt-dlp's `--cookies-from-browser` flag. No OAuth setup required — if you're logged into a platform in your browser, it just works.
+- **Auto-Refill**: A background monitor watches playlist position and fetches more content when running low, appending via mpv's `loadfile append` IPC command.
 
 ## Platform Support
 
@@ -120,6 +139,9 @@ Then restart Claude Code.
 | Account feeds | Yes (subs, liked, history) | No |
 | Search | Yes | No |
 | Shorts | Yes | N/A |
+| Queue management | Yes | Yes |
+| Audio-only | Yes | Yes |
+| Smart recommendations | Yes | Yes |
 
 ## Example Usage
 
@@ -128,6 +150,10 @@ Then restart Claude Code.
 > Search YouTube for "rust programming tutorials" and play the first result
 > Show me the latest TikToks from @nba
 > Play TikTok videos from @khaby.lame
+> Queue this video without stopping what's playing: <url>
+> Play similar videos to what's on now
+> Just play the audio, I don't need video
+> Switch to Firefox for cookies
 > What chapters does this video have? Then skip to chapter 3
 ```
 
