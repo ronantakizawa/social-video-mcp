@@ -4,12 +4,23 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { spawn, execSync, type ChildProcess } from 'child_process';
 import { createConnection } from 'net';
-import { unlinkSync, writeFileSync } from 'fs';
+import { unlinkSync, writeFileSync, existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { randomBytes } from 'crypto';
 
-const SOCKET_PATH = '/tmp/mpv-mcp-socket';
+// Randomized, user-scoped socket path to prevent symlink attacks
+const SOCKET_PATH = join(tmpdir(), `mpv-mcp-${process.getuid?.() ?? process.pid}-${randomBytes(4).toString('hex')}.sock`);
 const BROWSER = 'chrome';
+const YTDLP_TIMEOUT_MS = 60_000;
+
+const ALLOWED_YOUTUBE_HOSTS = [
+  'www.youtube.com',
+  'youtube.com',
+  'm.youtube.com',
+  'youtu.be',
+  'music.youtube.com',
+];
 
 const FEED_URLS: Record<string, string> = {
   subscriptions: 'https://www.youtube.com/feed/subscriptions',
@@ -20,16 +31,34 @@ const FEED_URLS: Record<string, string> = {
 
 let mpvProcess: ChildProcess | null = null;
 
-function mpvExists(): boolean {
+function validateYouTubeUrl(url: string): string | null {
   try {
-    execSync('which mpv', { stdio: 'ignore' });
+    const parsed = new URL(url);
+    if (!ALLOWED_YOUTUBE_HOSTS.includes(parsed.hostname)) {
+      return `URL must be a YouTube link. Got: ${parsed.hostname}`;
+    }
+    return null;
+  } catch {
+    return `Invalid URL: ${url}`;
+  }
+}
+
+function commandExists(cmd: string): boolean {
+  try {
+    execSync(`which ${cmd}`, { stdio: 'ignore' });
     return true;
   } catch {
     return false;
   }
 }
 
-function killExisting(): void {
+function checkDeps(): string | null {
+  if (!commandExists('mpv')) return 'mpv is not installed. Install with: brew install mpv';
+  if (!commandExists('yt-dlp')) return 'yt-dlp is not installed. Install with: brew install yt-dlp';
+  return null;
+}
+
+function cleanup(): void {
   if (mpvProcess) {
     try {
       mpvProcess.kill('SIGTERM');
@@ -43,6 +72,30 @@ function killExisting(): void {
   } catch {
     // socket didn't exist
   }
+}
+
+// Graceful shutdown
+for (const sig of ['SIGTERM', 'SIGINT'] as const) {
+  process.on(sig, () => {
+    cleanup();
+    process.exit(0);
+  });
+}
+
+function waitForSocket(path: string, timeoutMs: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    const check = () => {
+      if (existsSync(path)) {
+        resolve();
+      } else if (Date.now() - start > timeoutMs) {
+        reject(new Error('mpv socket did not appear — mpv may have failed to start'));
+      } else {
+        setTimeout(check, 200);
+      }
+    };
+    check();
+  });
 }
 
 function sendMpvCommand(command: unknown[]): Promise<Record<string, unknown>> {
@@ -65,7 +118,11 @@ function sendMpvCommand(command: unknown[]): Promise<Record<string, unknown>> {
           const parsed = JSON.parse(line);
           if ('error' in parsed) {
             socket.end();
-            resolve(parsed);
+            if (parsed.error !== 'success') {
+              reject(new Error(`mpv error: ${parsed.error}`));
+            } else {
+              resolve(parsed);
+            }
             return;
           }
         } catch {
@@ -88,8 +145,14 @@ function sendMpvCommand(command: unknown[]): Promise<Record<string, unknown>> {
         reject(new Error('No response from mpv'));
         return;
       }
+      const lines = data.split('\n').filter(Boolean);
       try {
-        resolve(JSON.parse(data.split('\n').filter(Boolean).pop()!));
+        const parsed = JSON.parse(lines[lines.length - 1]);
+        if (parsed.error && parsed.error !== 'success') {
+          reject(new Error(`mpv error: ${parsed.error}`));
+        } else {
+          resolve(parsed);
+        }
       } catch {
         reject(new Error('Invalid response from mpv'));
       }
@@ -102,67 +165,61 @@ async function getMpvProperty(name: string): Promise<unknown> {
   return result.data;
 }
 
-function fetchYtFeed(url: string, limit: number): Promise<{ entries: Array<Record<string, unknown>>; title?: string }> {
+function spawnYtDlp(args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    const args = [
-      url, '-J', '--flat-playlist',
-      '--extractor-args', 'youtubetab:approximate_date',
-      '--playlist-end', String(limit),
-      '--cookies-from-browser', BROWSER,
-    ];
-
     const proc = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
+
+    const timer = setTimeout(() => {
+      proc.kill('SIGTERM');
+      reject(new Error(`yt-dlp timed out after ${YTDLP_TIMEOUT_MS / 1000}s`));
+    }, YTDLP_TIMEOUT_MS);
 
     proc.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
     proc.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
 
     proc.on('close', (code) => {
+      clearTimeout(timer);
       if (code !== 0) {
         reject(new Error(`yt-dlp exited with code ${code}: ${stderr.slice(0, 500)}`));
         return;
       }
-      try {
-        resolve(JSON.parse(stdout));
-      } catch {
-        reject(new Error('Failed to parse yt-dlp output'));
-      }
+      resolve(stdout);
+    });
+
+    proc.on('error', (err) => {
+      clearTimeout(timer);
+      reject(new Error(`Failed to spawn yt-dlp: ${err.message}`));
     });
   });
 }
 
+function fetchYtFeed(url: string, limit: number): Promise<{ entries: Array<Record<string, unknown>>; title?: string }> {
+  const args = [
+    url, '-J', '--flat-playlist',
+    '--extractor-args', 'youtubetab:approximate_date',
+    '--playlist-end', String(limit),
+    '--cookies-from-browser', BROWSER,
+  ];
+  return spawnYtDlp(args).then((out) => JSON.parse(out));
+}
+
 function fetchVideoInfo(url: string): Promise<Record<string, unknown>> {
-  return new Promise((resolve, reject) => {
-    const args = [
-      url, '-J', '--no-playlist',
-      '--cookies-from-browser', BROWSER,
-    ];
+  const args = [
+    url, '-J', '--no-playlist',
+    '--cookies-from-browser', BROWSER,
+  ];
+  return spawnYtDlp(args).then((out) => JSON.parse(out));
+}
 
-    const proc = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '';
-    let stderr = '';
-
-    proc.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
-    proc.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
-
-    proc.on('close', (code) => {
-      if (code !== 0) {
-        reject(new Error(`yt-dlp exited with code ${code}: ${stderr.slice(0, 500)}`));
-        return;
-      }
-      try {
-        resolve(JSON.parse(stdout));
-      } catch {
-        reject(new Error('Failed to parse yt-dlp output'));
-      }
-    });
-  });
+function errorResult(msg: string) {
+  return { content: [{ type: 'text' as const, text: msg }], isError: true };
 }
 
 const server = new McpServer({
   name: 'yt-player-mcp',
-  version: '1.0.0',
+  version: '1.1.0',
 });
 
 // === Tool: play_video ===
@@ -174,14 +231,13 @@ server.tool(
     timestamp: z.number().min(0).optional().describe('Start position in seconds'),
   },
   async ({ url, timestamp }) => {
-    if (!mpvExists()) {
-      return {
-        content: [{ type: 'text' as const, text: 'Error: mpv is not installed. Install with: brew install mpv' }],
-        isError: true,
-      };
-    }
+    const urlErr = validateYouTubeUrl(url);
+    if (urlErr) return errorResult(urlErr);
 
-    killExisting();
+    const depErr = checkDeps();
+    if (depErr) return errorResult(depErr);
+
+    cleanup();
 
     const args = [
       `--input-ipc-server=${SOCKET_PATH}`,
@@ -208,14 +264,17 @@ server.tool(
       mpvProcess = null;
     });
 
-    // Give mpv a moment to start and create the socket
-    await new Promise((r) => setTimeout(r, 2000));
+    try {
+      await waitForSocket(SOCKET_PATH, 10_000);
+    } catch {
+      return errorResult('mpv failed to start. Run `mpv <url>` manually to see the error.');
+    }
 
     let title = url;
     try {
       title = (await getMpvProperty('media-title')) as string || url;
     } catch {
-      // mpv may still be loading
+      // mpv may still be loading metadata
     }
 
     return {
@@ -244,7 +303,7 @@ server.tool(
       };
     }
 
-    killExisting();
+    cleanup();
 
     return {
       content: [{ type: 'text' as const, text: 'Video stopped.' }],
@@ -268,13 +327,7 @@ server.tool(
         }],
       };
     } catch (err) {
-      return {
-        content: [{
-          type: 'text' as const,
-          text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-        }],
-        isError: true,
-      };
+      return errorResult(`Error: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 );
@@ -290,19 +343,10 @@ server.tool(
     try {
       await sendMpvCommand(['seek', seconds, 'absolute']);
       return {
-        content: [{
-          type: 'text' as const,
-          text: `Seeked to ${seconds}s.`,
-        }],
+        content: [{ type: 'text' as const, text: `Seeked to ${seconds}s.` }],
       };
     } catch (err) {
-      return {
-        content: [{
-          type: 'text' as const,
-          text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-        }],
-        isError: true,
-      };
+      return errorResult(`Error: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 );
@@ -333,13 +377,7 @@ server.tool(
         }],
       };
     } catch (err) {
-      return {
-        content: [{
-          type: 'text' as const,
-          text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-        }],
-        isError: true,
-      };
+      return errorResult(`Error: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 );
@@ -347,12 +385,15 @@ server.tool(
 // === Tool: get_youtube_feed ===
 server.tool(
   'get_youtube_feed',
-  'Fetch videos from your YouTube account using Chrome cookies. Supports: subscriptions, liked, watch_later, history, trending.',
+  'Fetch videos from your YouTube account using Chrome cookies. Supports: subscriptions, liked, watch_later, history.',
   {
     feed: z.enum(['subscriptions', 'liked', 'watch_later', 'history']).describe('Which feed to fetch'),
     limit: z.number().min(1).max(50).default(15).describe('Max number of videos to return (default 15)'),
   },
   async ({ feed, limit }) => {
+    const depErr = checkDeps();
+    if (depErr) return errorResult(depErr);
+
     const url = FEED_URLS[feed];
 
     try {
@@ -373,13 +414,7 @@ server.tool(
         }],
       };
     } catch (err) {
-      return {
-        content: [{
-          type: 'text' as const,
-          text: `Error fetching ${feed}: ${err instanceof Error ? err.message : String(err)}`,
-        }],
-        isError: true,
-      };
+      return errorResult(`Error fetching ${feed}: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 );
@@ -393,6 +428,9 @@ server.tool(
     limit: z.number().min(1).max(30).default(10).describe('Max results (default 10)'),
   },
   async ({ query, limit }) => {
+    const depErr = checkDeps();
+    if (depErr) return errorResult(depErr);
+
     const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
 
     try {
@@ -413,13 +451,7 @@ server.tool(
         }],
       };
     } catch (err) {
-      return {
-        content: [{
-          type: 'text' as const,
-          text: `Error searching: ${err instanceof Error ? err.message : String(err)}`,
-        }],
-        isError: true,
-      };
+      return errorResult(`Error searching: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 );
@@ -433,14 +465,13 @@ server.tool(
     shuffle: z.boolean().default(false).describe('Shuffle the playlist'),
   },
   async ({ url, shuffle }) => {
-    if (!mpvExists()) {
-      return {
-        content: [{ type: 'text' as const, text: 'Error: mpv is not installed. Install with: brew install mpv' }],
-        isError: true,
-      };
-    }
+    const urlErr = validateYouTubeUrl(url);
+    if (urlErr) return errorResult(urlErr);
 
-    killExisting();
+    const depErr = checkDeps();
+    if (depErr) return errorResult(depErr);
+
+    cleanup();
 
     const args = [
       `--input-ipc-server=${SOCKET_PATH}`,
@@ -464,7 +495,11 @@ server.tool(
     mpvProcess.unref();
     mpvProcess.on('exit', () => { mpvProcess = null; });
 
-    await new Promise((r) => setTimeout(r, 3000));
+    try {
+      await waitForSocket(SOCKET_PATH, 15_000);
+    } catch {
+      return errorResult('mpv failed to start. Run `mpv <url>` manually to see the error.');
+    }
 
     let title = url;
     let playlistCount: unknown = null;
@@ -509,13 +544,7 @@ server.tool(
         }],
       };
     } catch (err) {
-      return {
-        content: [{
-          type: 'text' as const,
-          text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-        }],
-        isError: true,
-      };
+      return errorResult(`Error: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 );
@@ -539,13 +568,7 @@ server.tool(
         }],
       };
     } catch (err) {
-      return {
-        content: [{
-          type: 'text' as const,
-          text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-        }],
-        isError: true,
-      };
+      return errorResult(`Error: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 );
@@ -558,6 +581,12 @@ server.tool(
     url: z.string().url().describe('YouTube video URL'),
   },
   async ({ url }) => {
+    const urlErr = validateYouTubeUrl(url);
+    if (urlErr) return errorResult(urlErr);
+
+    const depErr = checkDeps();
+    if (depErr) return errorResult(depErr);
+
     try {
       const info = await fetchVideoInfo(url);
       const chapters = (info.chapters as Array<Record<string, unknown>> | undefined)?.map((ch) => ({
@@ -583,13 +612,7 @@ server.tool(
         }],
       };
     } catch (err) {
-      return {
-        content: [{
-          type: 'text' as const,
-          text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-        }],
-        isError: true,
-      };
+      return errorResult(`Error: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 );
@@ -602,6 +625,9 @@ server.tool(
     limit: z.number().min(1).max(100).default(30).describe('Max channels to return (default 30)'),
   },
   async ({ limit }) => {
+    const depErr = checkDeps();
+    if (depErr) return errorResult(depErr);
+
     try {
       const result = await fetchYtFeed('https://www.youtube.com/feed/channels', limit);
       const channels = (result.entries || []).map((e: Record<string, unknown>) => ({
@@ -617,13 +643,7 @@ server.tool(
         }],
       };
     } catch (err) {
-      return {
-        content: [{
-          type: 'text' as const,
-          text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-        }],
-        isError: true,
-      };
+      return errorResult(`Error: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 );
@@ -637,6 +657,12 @@ server.tool(
     limit: z.number().min(1).max(50).default(15).describe('Max videos to return (default 15)'),
   },
   async ({ channel_url, limit }) => {
+    const urlErr = validateYouTubeUrl(channel_url);
+    if (urlErr) return errorResult(urlErr);
+
+    const depErr = checkDeps();
+    if (depErr) return errorResult(depErr);
+
     const url = channel_url.endsWith('/videos') ? channel_url : `${channel_url.replace(/\/$/, '')}/videos`;
 
     try {
@@ -656,13 +682,7 @@ server.tool(
         }],
       };
     } catch (err) {
-      return {
-        content: [{
-          type: 'text' as const,
-          text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-        }],
-        isError: true,
-      };
+      return errorResult(`Error: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 );
@@ -676,6 +696,12 @@ server.tool(
     limit: z.number().min(1).max(50).default(15).describe('Max shorts to return (default 15)'),
   },
   async ({ channel_url, limit }) => {
+    const urlErr = validateYouTubeUrl(channel_url);
+    if (urlErr) return errorResult(urlErr);
+
+    const depErr = checkDeps();
+    if (depErr) return errorResult(depErr);
+
     const base = channel_url.replace(/\/(shorts|videos)?\/?$/, '');
     const url = `${base}/shorts`;
 
@@ -696,13 +722,7 @@ server.tool(
         }],
       };
     } catch (err) {
-      return {
-        content: [{
-          type: 'text' as const,
-          text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-        }],
-        isError: true,
-      };
+      return errorResult(`Error: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 );
@@ -716,8 +736,10 @@ server.tool(
     shorts_per_channel: z.number().min(1).max(10).default(3).describe('Shorts to fetch per channel (default 3)'),
   },
   async ({ max_channels, shorts_per_channel }) => {
+    const depErr = checkDeps();
+    if (depErr) return errorResult(depErr);
+
     try {
-      // Step 1: Fetch subscribed channels
       const subsResult = await fetchYtFeed('https://www.youtube.com/feed/channels', max_channels);
       const channels = (subsResult.entries || []).slice(0, max_channels);
 
@@ -727,7 +749,6 @@ server.tool(
         };
       }
 
-      // Step 2: Fetch shorts from each channel in parallel
       const results = await Promise.allSettled(
         channels.map(async (ch: Record<string, unknown>) => {
           const channelUrl = (ch.channel_url || ch.url) as string;
@@ -752,7 +773,6 @@ server.tool(
         }
       }
 
-      // Sort by upload date descending (newest first)
       allShorts.sort((a, b) => {
         const da = String(a.upload_date || '');
         const db = String(b.upload_date || '');
@@ -772,13 +792,7 @@ server.tool(
         }],
       };
     } catch (err) {
-      return {
-        content: [{
-          type: 'text' as const,
-          text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-        }],
-        isError: true,
-      };
+      return errorResult(`Error: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 );
@@ -796,18 +810,13 @@ server.tool(
     shuffle: z.boolean().default(false).describe('Shuffle the playback order'),
   },
   async ({ source, channel_url, max_channels, shorts_per_channel, limit, shuffle }) => {
-    if (!mpvExists()) {
-      return {
-        content: [{ type: 'text' as const, text: 'Error: mpv is not installed. Install with: brew install mpv' }],
-        isError: true,
-      };
-    }
+    const depErr = checkDeps();
+    if (depErr) return errorResult(depErr);
 
-    if (source === 'channel' && !channel_url) {
-      return {
-        content: [{ type: 'text' as const, text: 'Error: channel_url is required when source is "channel".' }],
-        isError: true,
-      };
+    if (source === 'channel') {
+      if (!channel_url) return errorResult('channel_url is required when source is "channel".');
+      const urlErr = validateYouTubeUrl(channel_url);
+      if (urlErr) return errorResult(urlErr);
     }
 
     let urls: string[] = [];
@@ -818,7 +827,6 @@ server.tool(
         const result = await fetchYtFeed(`${base}/shorts`, limit);
         urls = (result.entries || []).map((e: Record<string, unknown>) => e.url as string).filter(Boolean);
       } else {
-        // Fetch subscribed channels, then shorts from each
         const subsResult = await fetchYtFeed('https://www.youtube.com/feed/channels', max_channels);
         const channels = (subsResult.entries || []).slice(0, max_channels);
 
@@ -839,26 +847,17 @@ server.tool(
         }
       }
     } catch (err) {
-      return {
-        content: [{
-          type: 'text' as const,
-          text: `Error fetching shorts: ${err instanceof Error ? err.message : String(err)}`,
-        }],
-        isError: true,
-      };
+      return errorResult(`Error fetching shorts: ${err instanceof Error ? err.message : String(err)}`);
     }
 
     if (urls.length === 0) {
-      return {
-        content: [{ type: 'text' as const, text: 'No shorts found.' }],
-      };
+      return { content: [{ type: 'text' as const, text: 'No shorts found.' }] };
     }
 
-    // Write URLs to a temp playlist file
-    const playlistPath = join(tmpdir(), 'mpv-mcp-shorts.txt');
+    const playlistPath = join(tmpdir(), `mpv-mcp-shorts-${randomBytes(4).toString('hex')}.txt`);
     writeFileSync(playlistPath, urls.join('\n') + '\n');
 
-    killExisting();
+    cleanup();
 
     const args = [
       `--input-ipc-server=${SOCKET_PATH}`,
@@ -881,7 +880,11 @@ server.tool(
     mpvProcess.unref();
     mpvProcess.on('exit', () => { mpvProcess = null; });
 
-    await new Promise((r) => setTimeout(r, 3000));
+    try {
+      await waitForSocket(SOCKET_PATH, 15_000);
+    } catch {
+      return errorResult('mpv failed to start. Run `mpv <url>` manually to see the error.');
+    }
 
     let title = 'Shorts playlist';
     try {
