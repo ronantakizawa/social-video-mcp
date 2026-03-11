@@ -1,0 +1,40 @@
+{
+  "name": "yt-player-mcp",
+  "version": "1.0.0",
+  "description": "MCP server that lets AI agents play YouTube videos via mpv",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "yt-player-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc && shx chmod +x dist/*.js",
+    "prepare": "npm run build",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "keywords": [
+    "mcp",
+    "youtube",
+    "video",
+    "mpv",
+    "claude",
+    "ai"
+  ],
+  "author": "Ronan Takizawa",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.9.0",
+    "shx": "^0.3.4",
+    "tsx": "^4.0.0",
+    "typescript": "^5.2.2"
+  }
+}
