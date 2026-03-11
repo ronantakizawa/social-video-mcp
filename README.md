@@ -4,6 +4,10 @@ MCP server that gives AI agents the ability to play videos from YouTube and TikT
 
 Built for [Claude Code](https://claude.ai/claude-code) and any MCP-compatible client.
 
+
+https://github.com/user-attachments/assets/08ddb1b3-ed0f-4de3-b465-c0b58ebfa894
+
+
 ## Features
 
 **Playback** — Play videos from YouTube or TikTok in a native mpv window with full remote control:
