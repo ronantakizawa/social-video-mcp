@@ -665,5 +665,121 @@ server.tool(
   }
 );
 
+// === Tool: get_channel_shorts ===
+server.tool(
+  'get_channel_shorts',
+  'List recent Shorts from a specific YouTube channel.',
+  {
+    channel_url: z.string().url().describe('YouTube channel URL (e.g. https://www.youtube.com/@ChannelName)'),
+    limit: z.number().min(1).max(50).default(15).describe('Max shorts to return (default 15)'),
+  },
+  async ({ channel_url, limit }) => {
+    const base = channel_url.replace(/\/(shorts|videos)?\/?$/, '');
+    const url = `${base}/shorts`;
+
+    try {
+      const result = await fetchYtFeed(url, limit);
+      const entries = (result.entries || []).map((e: Record<string, unknown>) => ({
+        title: e.title,
+        url: e.url,
+        duration: e.duration,
+        view_count: e.view_count,
+        upload_date: e.upload_date,
+      }));
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify({ channel: result.title || channel_url, count: entries.length, shorts: entries }, null, 2),
+        }],
+      };
+    } catch (err) {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+        }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// === Tool: get_subscription_shorts ===
+server.tool(
+  'get_subscription_shorts',
+  'Fetch recent Shorts from your subscribed YouTube channels. Pulls your subscriptions, then grabs the latest Shorts from each. This can take a while depending on how many channels are sampled.',
+  {
+    max_channels: z.number().min(1).max(20).default(5).describe('How many subscribed channels to sample (default 5)'),
+    shorts_per_channel: z.number().min(1).max(10).default(3).describe('Shorts to fetch per channel (default 3)'),
+  },
+  async ({ max_channels, shorts_per_channel }) => {
+    try {
+      // Step 1: Fetch subscribed channels
+      const subsResult = await fetchYtFeed('https://www.youtube.com/feed/channels', max_channels);
+      const channels = (subsResult.entries || []).slice(0, max_channels);
+
+      if (channels.length === 0) {
+        return {
+          content: [{ type: 'text' as const, text: 'No subscribed channels found.' }],
+        };
+      }
+
+      // Step 2: Fetch shorts from each channel in parallel
+      const results = await Promise.allSettled(
+        channels.map(async (ch: Record<string, unknown>) => {
+          const channelUrl = (ch.channel_url || ch.url) as string;
+          if (!channelUrl) return [];
+          const base = channelUrl.replace(/\/(shorts|videos)?\/?$/, '');
+          const shortsResult = await fetchYtFeed(`${base}/shorts`, shorts_per_channel);
+          return (shortsResult.entries || []).map((e: Record<string, unknown>) => ({
+            title: e.title,
+            url: e.url,
+            channel: ch.channel || ch.title,
+            duration: e.duration,
+            view_count: e.view_count,
+            upload_date: e.upload_date,
+          }));
+        })
+      );
+
+      const allShorts: Array<Record<string, unknown>> = [];
+      for (const r of results) {
+        if (r.status === 'fulfilled') {
+          allShorts.push(...r.value);
+        }
+      }
+
+      // Sort by upload date descending (newest first)
+      allShorts.sort((a, b) => {
+        const da = String(a.upload_date || '');
+        const db = String(b.upload_date || '');
+        return db.localeCompare(da);
+      });
+
+      const channelsSampled = channels.map((ch: Record<string, unknown>) => ch.channel || ch.title);
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify({
+            channels_sampled: channelsSampled,
+            count: allShorts.length,
+            shorts: allShorts,
+          }, null, 2),
+        }],
+      };
+    } catch (err) {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+        }],
+        isError: true,
+      };
+    }
+  }
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
