@@ -381,7 +381,7 @@ server.tool(
 
 server.tool(
   'play_shorts',
-  'Play Shorts as a continuous auto-advancing playlist. Fetch from a specific channel or from your subscribed channels.',
+  'Play Shorts as a continuous auto-advancing playlist. Automatically fetches more as you watch. Fetch from a specific channel or from your subscribed channels.',
   {
     source: z.enum(['channel', 'subscriptions']).describe('"channel" or "subscriptions"'),
     channel_url: z.string().url().optional().describe('Required when source is "channel". YouTube channel URL.'),
@@ -423,10 +423,19 @@ server.tool(
       return errorResult('mpv failed to start. Run `mpv <url>` manually to see the error.');
     }
 
+    // Auto-refill for channel source (subscription source is harder to paginate)
+    if (source === 'channel' && channel_url) {
+      const shortsUrl = `${stripChannelSuffix(channel_url)}/shorts`;
+      mpv.startAutoRefill(urls.length, async (offset, batch) => {
+        const more = await fetchFeed(shortsUrl, batch, offset + 1);
+        return (more.entries || []).map((e) => e.url as string).filter(Boolean);
+      });
+    }
+
     let title = 'Shorts playlist';
     try { title = (await mpv.getProperty('media-title')) as string || title; } catch { /* loading */ }
 
-    return textResult({ status: 'playing_shorts', title, total: urls.length, shuffle, source });
+    return textResult({ status: 'playing_shorts', title, total: urls.length, shuffle, source, autoRefill: source === 'channel' });
   }
 );
 
@@ -466,10 +475,10 @@ server.tool(
 
 server.tool(
   'play_tiktok_user',
-  'Play videos from a TikTok user as a continuous auto-advancing playlist.',
+  'Play videos from a TikTok user as a continuous auto-advancing playlist. Automatically fetches more videos as you watch.',
   {
     username: z.string().describe('TikTok username (with or without @)'),
-    limit: z.number().min(1).max(30).default(15).describe('Max videos to play (default 15)'),
+    limit: z.number().min(1).max(30).default(15).describe('Initial batch size (default 15)'),
     shuffle: z.boolean().default(false).describe('Shuffle playback order'),
   },
   async ({ username, limit, shuffle }) => {
@@ -477,20 +486,26 @@ server.tool(
     if (depErr) return errorResult(depErr);
 
     const handle = username.startsWith('@') ? username : `@${username}`;
-    const url = `https://www.tiktok.com/${handle}`;
+    const feedUrl = `https://www.tiktok.com/${handle}`;
 
     try {
-      const result = await fetchFeed(url, limit);
+      const result = await fetchFeed(feedUrl, limit);
       const urls = (result.entries || []).map((e) => e.url as string).filter(Boolean);
       if (urls.length === 0) return textResult('No videos found.');
 
       const playlistFile = mpv.writeTempPlaylist(urls);
       await mpv.launch({ playlistFile, shuffle, socketTimeoutMs: 15_000 });
 
+      // Auto-refill: fetch more videos as the playlist runs low
+      mpv.startAutoRefill(urls.length, async (offset, batch) => {
+        const more = await fetchFeed(feedUrl, batch, offset + 1);
+        return (more.entries || []).map((e) => e.url as string).filter(Boolean);
+      });
+
       let title = handle;
       try { title = (await mpv.getProperty('media-title')) as string || handle; } catch { /* loading */ }
 
-      return textResult({ status: 'playing_tiktok', username: handle, total: urls.length, title, shuffle });
+      return textResult({ status: 'playing_tiktok', username: handle, total: urls.length, title, shuffle, autoRefill: true });
     } catch (err) {
       return errorResult(`Error: ${err instanceof Error ? err.message : String(err)}`);
     }

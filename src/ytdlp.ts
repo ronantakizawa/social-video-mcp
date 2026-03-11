@@ -36,10 +36,11 @@ function spawnYtDlp(args: string[]): Promise<string> {
   });
 }
 
-export function fetchFeed(url: string, limit: number): Promise<YtFeedResult> {
+export function fetchFeed(url: string, limit: number, start = 1): Promise<YtFeedResult> {
   const args = [
     url, '-J', '--flat-playlist',
-    '--playlist-end', String(limit),
+    '--playlist-start', String(start),
+    '--playlist-end', String(start + limit - 1),
     '--cookies-from-browser', BROWSER,
   ];
 

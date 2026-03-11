@@ -11,6 +11,7 @@ const SOCKET_PATH = join(tmpdir(), `mpv-mcp-${process.getuid?.() ?? process.pid}
 let mpvProcess: ChildProcess | null = null;
 
 export function cleanup(): void {
+  stopAutoRefill();
   if (mpvProcess) {
     try { mpvProcess.kill('SIGTERM'); } catch { /* already dead */ }
     mpvProcess = null;
@@ -106,6 +107,7 @@ export async function launch(opts: LaunchOptions): Promise<void> {
     '--no-terminal',
     '--ytdl',
     `--ytdl-raw-options=cookies-from-browser=${BROWSER}`,
+    '--prefetch-playlist',
   ];
 
   if (opts.shuffle) args.push('--shuffle');
@@ -124,4 +126,56 @@ export function writeTempPlaylist(urls: string[]): string {
   const path = join(tmpdir(), `mpv-mcp-shorts-${randomBytes(4).toString('hex')}.txt`);
   writeFileSync(path, urls.join('\n') + '\n');
   return path;
+}
+
+export async function appendUrl(url: string): Promise<void> {
+  await sendCommand(['loadfile', url, 'append']);
+}
+
+// --- Auto-refill monitor ---
+
+type RefillFn = (offset: number, limit: number) => Promise<string[]>;
+
+let refillTimer: ReturnType<typeof setInterval> | null = null;
+let refillOffset = 0;
+let refillFetching = false;
+
+const REFILL_CHECK_INTERVAL = 5_000;  // check every 5s
+const REFILL_THRESHOLD = 3;           // fetch more when <= 3 videos left
+const REFILL_BATCH = 15;              // fetch 15 more at a time
+
+export function stopAutoRefill(): void {
+  if (refillTimer) { clearInterval(refillTimer); refillTimer = null; }
+  refillOffset = 0;
+  refillFetching = false;
+}
+
+export function startAutoRefill(initialCount: number, fetchMore: RefillFn): void {
+  stopAutoRefill();
+  refillOffset = initialCount;
+
+  refillTimer = setInterval(async () => {
+    if (!mpvProcess || refillFetching) return;
+
+    try {
+      const pos = await getProperty('playlist-pos') as number;
+      const count = await getProperty('playlist-count') as number;
+      const remaining = count - pos - 1;
+
+      if (remaining <= REFILL_THRESHOLD) {
+        refillFetching = true;
+        try {
+          const newUrls = await fetchMore(refillOffset, REFILL_BATCH);
+          if (newUrls.length === 0) { stopAutoRefill(); return; }
+          for (const url of newUrls) await appendUrl(url);
+          refillOffset += newUrls.length;
+        } finally {
+          refillFetching = false;
+        }
+      }
+    } catch {
+      // mpv died or IPC failed — stop monitoring
+      stopAutoRefill();
+    }
+  }, REFILL_CHECK_INTERVAL);
 }
