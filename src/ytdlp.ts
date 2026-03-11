@@ -37,12 +37,18 @@ function spawnYtDlp(args: string[]): Promise<string> {
 }
 
 export function fetchFeed(url: string, limit: number): Promise<YtFeedResult> {
-  return spawnYtDlp([
+  const args = [
     url, '-J', '--flat-playlist',
-    '--extractor-args', 'youtubetab:approximate_date',
     '--playlist-end', String(limit),
     '--cookies-from-browser', BROWSER,
-  ]).then((out) => JSON.parse(out));
+  ];
+
+  // YouTube-specific extractor arg
+  if (url.includes('youtube.com') || url.includes('youtu.be')) {
+    args.push('--extractor-args', 'youtubetab:approximate_date');
+  }
+
+  return spawnYtDlp(args).then((out) => JSON.parse(out));
 }
 
 export function fetchVideoInfo(url: string): Promise<YtEntry> {

@@ -4,7 +4,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import * as mpv from './mpv.js';
 import { fetchFeed, fetchVideoInfo, pickVideoFields } from './ytdlp.js';
-import { validateYouTubeUrl, checkDeps, errorResult, textResult, stripChannelSuffix, FEED_URLS } from './validate.js';
+import { validateYouTubeUrl, validateVideoUrl, validateTikTokUrl, validateInstagramUrl, checkDeps, errorResult, textResult, stripChannelSuffix, FEED_URLS } from './validate.js';
 
 const server = new McpServer({ name: 'yt-player-mcp', version: '1.2.0' });
 
@@ -12,13 +12,13 @@ const server = new McpServer({ name: 'yt-player-mcp', version: '1.2.0' });
 
 server.tool(
   'play_video',
-  'Play a YouTube video in a lightweight mpv player window. Optionally start at a specific timestamp.',
+  'Play a video from YouTube, TikTok, or Instagram in a lightweight mpv player window. Optionally start at a specific timestamp.',
   {
-    url: z.string().url().describe('YouTube video URL'),
+    url: z.string().url().describe('YouTube, TikTok, or Instagram video URL'),
     timestamp: z.number().min(0).optional().describe('Start position in seconds'),
   },
   async ({ url, timestamp }) => {
-    const urlErr = validateYouTubeUrl(url);
+    const urlErr = validateVideoUrl(url);
     if (urlErr) return errorResult(urlErr);
     const depErr = checkDeps();
     if (depErr) return errorResult(depErr);
@@ -216,10 +216,10 @@ server.tool(
 
 server.tool(
   'get_video_info',
-  'Fetch full metadata for a YouTube video without playing it: title, description, chapters, duration, channel, upload date, view count, tags.',
-  { url: z.string().url().describe('YouTube video URL') },
+  'Fetch full metadata for a YouTube, TikTok, or Instagram video without playing it: title, description, chapters, duration, channel, upload date, view count, tags.',
+  { url: z.string().url().describe('YouTube, TikTok, or Instagram video URL') },
   async ({ url }) => {
-    const urlErr = validateYouTubeUrl(url);
+    const urlErr = validateVideoUrl(url);
     if (urlErr) return errorResult(urlErr);
     const depErr = checkDeps();
     if (depErr) return errorResult(depErr);
@@ -427,6 +427,131 @@ server.tool(
     try { title = (await mpv.getProperty('media-title')) as string || title; } catch { /* loading */ }
 
     return textResult({ status: 'playing_shorts', title, total: urls.length, shuffle, source });
+  }
+);
+
+// --- TikTok tools ---
+
+server.tool(
+  'get_tiktok_user_videos',
+  'Fetch recent videos from a TikTok user profile. Uses Chrome cookies for authentication.',
+  {
+    username: z.string().describe('TikTok username (with or without @)'),
+    limit: z.number().min(1).max(30).default(15).describe('Max videos to return (default 15)'),
+  },
+  async ({ username, limit }) => {
+    const depErr = checkDeps();
+    if (depErr) return errorResult(depErr);
+
+    const handle = username.startsWith('@') ? username : `@${username}`;
+    const url = `https://www.tiktok.com/${handle}`;
+
+    try {
+      const result = await fetchFeed(url, limit);
+      const videos = (result.entries || []).map((e) => ({
+        title: e.title,
+        url: e.url,
+        duration: e.duration,
+        view_count: e.view_count,
+        like_count: e.like_count,
+        comment_count: e.comment_count,
+        uploader: e.uploader,
+      }));
+      return textResult({ username: handle, count: videos.length, videos });
+    } catch (err) {
+      return errorResult(`Error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+);
+
+server.tool(
+  'play_tiktok_user',
+  'Play videos from a TikTok user as a continuous auto-advancing playlist.',
+  {
+    username: z.string().describe('TikTok username (with or without @)'),
+    limit: z.number().min(1).max(30).default(15).describe('Max videos to play (default 15)'),
+    shuffle: z.boolean().default(false).describe('Shuffle playback order'),
+  },
+  async ({ username, limit, shuffle }) => {
+    const depErr = checkDeps();
+    if (depErr) return errorResult(depErr);
+
+    const handle = username.startsWith('@') ? username : `@${username}`;
+    const url = `https://www.tiktok.com/${handle}`;
+
+    try {
+      const result = await fetchFeed(url, limit);
+      const urls = (result.entries || []).map((e) => e.url as string).filter(Boolean);
+      if (urls.length === 0) return textResult('No videos found.');
+
+      const playlistFile = mpv.writeTempPlaylist(urls);
+      await mpv.launch({ playlistFile, shuffle, socketTimeoutMs: 15_000 });
+
+      let title = handle;
+      try { title = (await mpv.getProperty('media-title')) as string || handle; } catch { /* loading */ }
+
+      return textResult({ status: 'playing_tiktok', username: handle, total: urls.length, title, shuffle });
+    } catch (err) {
+      return errorResult(`Error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+);
+
+// --- Instagram tools ---
+
+server.tool(
+  'play_instagram_video',
+  'Play an Instagram Reel or post video in mpv. Requires being logged into Instagram in Chrome.',
+  {
+    url: z.string().url().describe('Instagram post or Reel URL'),
+  },
+  async ({ url }) => {
+    const urlErr = validateInstagramUrl(url);
+    if (urlErr) return errorResult(urlErr);
+    const depErr = checkDeps();
+    if (depErr) return errorResult(depErr);
+
+    try {
+      await mpv.launch({ url });
+    } catch {
+      return errorResult('mpv failed to start. Make sure you are logged into Instagram in Chrome.');
+    }
+
+    let title = url;
+    try { title = (await mpv.getProperty('media-title')) as string || url; } catch { /* loading */ }
+
+    return textResult({ status: 'playing', title, url, platform: 'instagram' });
+  }
+);
+
+server.tool(
+  'get_instagram_post_info',
+  'Fetch metadata for an Instagram post or Reel without playing it. Requires being logged into Instagram in Chrome.',
+  {
+    url: z.string().url().describe('Instagram post or Reel URL'),
+  },
+  async ({ url }) => {
+    const urlErr = validateInstagramUrl(url);
+    if (urlErr) return errorResult(urlErr);
+    const depErr = checkDeps();
+    if (depErr) return errorResult(depErr);
+
+    try {
+      const info = await fetchVideoInfo(url);
+      return textResult({
+        title: info.title,
+        uploader: info.uploader,
+        channel: info.channel,
+        duration: info.duration,
+        view_count: info.view_count,
+        like_count: info.like_count,
+        comment_count: info.comment_count,
+        description: info.description,
+        upload_date: info.upload_date,
+      });
+    } catch (err) {
+      return errorResult(`Error: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 );
 
