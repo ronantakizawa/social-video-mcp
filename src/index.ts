@@ -4,7 +4,9 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { spawn, execSync, type ChildProcess } from 'child_process';
 import { createConnection } from 'net';
-import { unlinkSync } from 'fs';
+import { unlinkSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 const SOCKET_PATH = '/tmp/mpv-mcp-socket';
 const BROWSER = 'chrome';
@@ -778,6 +780,128 @@ server.tool(
         isError: true,
       };
     }
+  }
+);
+
+// === Tool: play_shorts ===
+server.tool(
+  'play_shorts',
+  'Play Shorts as a continuous auto-advancing playlist. Fetch from a specific channel or from your subscribed channels. Each Short auto-advances to the next when done.',
+  {
+    source: z.enum(['channel', 'subscriptions']).describe('"channel" to play from a specific channel, "subscriptions" to sample from your subscribed channels'),
+    channel_url: z.string().url().optional().describe('Required when source is "channel". YouTube channel URL.'),
+    max_channels: z.number().min(1).max(20).default(5).describe('When source is "subscriptions": how many channels to sample (default 5)'),
+    shorts_per_channel: z.number().min(1).max(10).default(3).describe('When source is "subscriptions": shorts per channel (default 3)'),
+    limit: z.number().min(1).max(50).default(15).describe('When source is "channel": max shorts to fetch (default 15)'),
+    shuffle: z.boolean().default(false).describe('Shuffle the playback order'),
+  },
+  async ({ source, channel_url, max_channels, shorts_per_channel, limit, shuffle }) => {
+    if (!mpvExists()) {
+      return {
+        content: [{ type: 'text' as const, text: 'Error: mpv is not installed. Install with: brew install mpv' }],
+        isError: true,
+      };
+    }
+
+    if (source === 'channel' && !channel_url) {
+      return {
+        content: [{ type: 'text' as const, text: 'Error: channel_url is required when source is "channel".' }],
+        isError: true,
+      };
+    }
+
+    let urls: string[] = [];
+
+    try {
+      if (source === 'channel') {
+        const base = channel_url!.replace(/\/(shorts|videos)?\/?$/, '');
+        const result = await fetchYtFeed(`${base}/shorts`, limit);
+        urls = (result.entries || []).map((e: Record<string, unknown>) => e.url as string).filter(Boolean);
+      } else {
+        // Fetch subscribed channels, then shorts from each
+        const subsResult = await fetchYtFeed('https://www.youtube.com/feed/channels', max_channels);
+        const channels = (subsResult.entries || []).slice(0, max_channels);
+
+        const results = await Promise.allSettled(
+          channels.map(async (ch: Record<string, unknown>) => {
+            const chUrl = (ch.channel_url || ch.url) as string;
+            if (!chUrl) return [];
+            const base = chUrl.replace(/\/(shorts|videos)?\/?$/, '');
+            const shortsResult = await fetchYtFeed(`${base}/shorts`, shorts_per_channel);
+            return (shortsResult.entries || []).map((e: Record<string, unknown>) => e.url as string).filter(Boolean);
+          })
+        );
+
+        for (const r of results) {
+          if (r.status === 'fulfilled') {
+            urls.push(...r.value);
+          }
+        }
+      }
+    } catch (err) {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: `Error fetching shorts: ${err instanceof Error ? err.message : String(err)}`,
+        }],
+        isError: true,
+      };
+    }
+
+    if (urls.length === 0) {
+      return {
+        content: [{ type: 'text' as const, text: 'No shorts found.' }],
+      };
+    }
+
+    // Write URLs to a temp playlist file
+    const playlistPath = join(tmpdir(), 'mpv-mcp-shorts.txt');
+    writeFileSync(playlistPath, urls.join('\n') + '\n');
+
+    killExisting();
+
+    const args = [
+      `--input-ipc-server=${SOCKET_PATH}`,
+      '--force-window',
+      '--no-terminal',
+      '--ytdl',
+      `--ytdl-raw-options=cookies-from-browser=${BROWSER}`,
+      `--playlist=${playlistPath}`,
+    ];
+
+    if (shuffle) {
+      args.push('--shuffle');
+    }
+
+    mpvProcess = spawn('mpv', args, {
+      detached: true,
+      stdio: 'ignore',
+    });
+
+    mpvProcess.unref();
+    mpvProcess.on('exit', () => { mpvProcess = null; });
+
+    await new Promise((r) => setTimeout(r, 3000));
+
+    let title = 'Shorts playlist';
+    try {
+      title = (await getMpvProperty('media-title')) as string || title;
+    } catch {
+      // still loading
+    }
+
+    return {
+      content: [{
+        type: 'text' as const,
+        text: JSON.stringify({
+          status: 'playing_shorts',
+          title,
+          total: urls.length,
+          shuffle,
+          source,
+        }, null, 2),
+      }],
+    };
   }
 );
 
